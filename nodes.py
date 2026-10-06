@@ -20,6 +20,23 @@ import urllib.request
 
 import torch
 
+# ---- BSAI 插件协同 SDK：加载即自动注册（ComfyUI 启动自动触发） ----
+import sys
+import os as _os
+_ORCH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                      "..", "BSAI-ComfyUI-Orchestrator")
+if _ORCH not in sys.path:
+    sys.path.insert(0, _ORCH)
+from bsai_orch_client import BSAIOrch  # noqa: E402
+
+BSAIOrch.register(
+    name="BSAI-VAERouter",
+    kind="vae_decode",                      # 能力类型：VAE 解码
+    hardware=["xpu", "cuda", "cpu"],        # 偏好顺序：核显 XPU → GPU1 → CPU
+    endpoint="http://127.0.0.1:8190/vae/decode",  # XPU 转发端点
+    health="http://127.0.0.1:8190/health/ready",  # 健康探针
+)
+
 _VAE_DEVICE = {}  # id(vae) -> device str
 
 _XPU_WORKER_URL = "http://127.0.0.1:8190"
@@ -81,13 +98,14 @@ def _move_vae(vae, dev: str) -> None:
     _VAE_DEVICE[key] = dev
 
 
-def _xpu_worker_decode(samples):
+def _xpu_worker_decode(samples, endpoint=None):
     """转发 8190 XPU worker 解码（二进制协议），返回 CPU float32 IMAGE 张量"""
+    url = (endpoint or _XPU_WORKER_URL + "/vae/decode")
     lat = samples.detach().cpu().float().contiguous()
     b = lat.numpy().tobytes()
     head = _MAGIC + struct.pack("<I", lat.dim()) + struct.pack("<%dI" % lat.dim(), *lat.shape)
     req = urllib.request.Request(
-        _XPU_WORKER_URL + "/vae/decode", data=head + b,
+        url, data=head + b,
         headers={"Content-Type": "application/octet-stream"})
     with urllib.request.urlopen(req, timeout=900) as resp:
         out = resp.read()
@@ -102,10 +120,10 @@ def _xpu_worker_decode(samples):
     return torch.from_numpy(arr).reshape(shape)
 
 
-def _decode_on(vae, samples, dev: str):
+def _decode_on(vae, samples, dev: str, endpoint=None):
     """在目标设备上解码（xpu 跨进程转发；cuda/cpu 本进程）"""
     if dev == "xpu":
-        out = _xpu_worker_decode(samples)
+        out = _xpu_worker_decode(samples, endpoint)
         return out.float()
     _move_vae(vae, dev)
     s = samples.to(dev)
@@ -157,13 +175,31 @@ class BSAIVAEDecodeRouter:
     CATEGORY = "BSAI/VAE 路由"
 
     def decode(self, vae, latent, strategy, cuda_free_threshold_mb):
-        dev = _pick_device(strategy, cuda_free_threshold_mb)
         samples = latent.get("samples")
         if samples is None:
             raise ValueError("latent 缺少 samples")
-        img = _decode_on(vae, samples, dev)
+        used = None
+        if strategy == "auto":
+            # 自动协同：SDK 自动探活 + 水位分流 + 跨进程租约 + 端点
+            alloc = BSAIOrch.allocate("vae_decode", requester="8191",
+                                      gpu_free_mb=_cuda_free_mb())
+            if not alloc.ok:
+                # 全部离线/被占用 → 降级 CPU（显存零占用兜底）
+                used = "cpu"
+                print("[BSAI-VAERouter] SDK 分配失败(%s) → 降级 CPU" % alloc.reason)
+                img = _decode_on(vae, samples, used)
+            else:
+                used = alloc.target
+                try:
+                    img = _decode_on(vae, samples, used, endpoint=alloc.endpoint)
+                finally:
+                    alloc.release()  # 停 watchdog + 释放租约
+        else:
+            # 显式策略：尊重用户选择（不自动协同）
+            used = _pick_device(strategy, cuda_free_threshold_mb)
+            img = _decode_on(vae, samples, used)
         print("[BSAI-VAERouter] decode on %s -> %s (cuda_free=%dMB)" % (
-            dev, tuple(img.shape), int(_cuda_free_mb())))
+            used, tuple(img.shape), int(_cuda_free_mb())))
         return (img,)
 
 
